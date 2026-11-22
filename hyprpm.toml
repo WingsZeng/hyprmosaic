@@ -1,0 +1,14 @@
+[repository]
+name = "hyprmosaic"
+authors = ["WingsZeng"]
+commit_pins = []
+
+[hyprmosaic]
+description = "The Mosaic layout separated from Hyprdrive"
+authors = ["WingsZeng"]
+output = "build/hyprmosaic.so"
+build = [
+    "git submodule update --init --recursive",
+    "cmake -S . -B build -DCMAKE_BUILD_TYPE=Release",
+    "cmake --build build --parallel",
+]

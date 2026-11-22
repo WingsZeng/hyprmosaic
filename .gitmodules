@@ -1,0 +1,3 @@
+[submodule "Hyprdrive"]
+	path = Hyprdrive
+	url = https://github.com/dragosol/Hyprdrive.git
