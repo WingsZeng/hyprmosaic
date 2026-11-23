@@ -5,6 +5,6 @@
 #include <typeinfo>
 
 namespace Hyprmosaic {
-UP<Layout::ITiledAlgorithm> makeLayout();
-const std::type_info *layoutType();
+[[nodiscard]] UP<Layout::ITiledAlgorithm> makeLayout();
+[[nodiscard]] const std::type_info *layoutType() noexcept;
 } // namespace Hyprmosaic

@@ -11,23 +11,48 @@
 #include <hyprland/src/layout/target/Target.hpp>
 
 #include <algorithm>
+#include <cassert>
+#include <iterator>
 #include <optional>
+#include <ranges>
+#include <utility>
 #include <vector>
 
 namespace {
 using namespace Layout;
 using namespace Hyprdrive::MosaicPack;
+using Hyprmosaic::Config::FocusMode;
 
 class CMosaicLayout final : public ITiledAlgorithm {
 public:
-  CMosaicLayout() : m_focusMode(Hyprmosaic::Config::focusModeEnabled()) {
+  CMosaicLayout() : m_focusMode(Hyprmosaic::Config::focusMode()) {
     m_focusListener = Event::bus()->m_events.window.active.listen(
         [this](PHLWINDOW window, Desktop::eFocusReason) {
-          if (!m_focusMode || !window ||
-              !m_parent->space()->workspace()->visible())
+          if (!window || !m_parent->space()->workspace()->visible())
             return;
 
-          centerTarget(m_memo.out, window->layoutTarget());
+          const auto target = window->layoutTarget();
+          if (findTarget(target) == m_targets.end())
+            return;
+
+          switch (m_focusMode) {
+          case FocusMode::Smart: {
+            const auto from = m_lastFocus.lock();
+            if (from == target || findTarget(from) == m_targets.end()) {
+              if (!fullyVisible(target))
+                revealTarget(target, {});
+            } else if (!fullyVisible(target) || !fullyVisible(from))
+              revealTarget(target, from);
+            break;
+          }
+          case FocusMode::Center:
+            centerTarget(target);
+            break;
+          case FocusMode::Count:
+            std::unreachable();
+          }
+
+          m_lastFocus = target;
         });
   }
 
@@ -47,18 +72,14 @@ public:
   }
 
   void removeTarget(SP<ITarget> target) override {
-    std::erase_if(m_targets, [&](const auto &sizedTarget) {
-      return sizedTarget.target.lock() == target;
-    });
+    if (const auto it = findTarget(target); it != m_targets.end())
+      m_targets.erase(it);
     recalculate();
   }
 
   void resizeTarget(const Vector2D &delta, SP<ITarget> target,
                     eRectCorner corner) override {
-    const auto it =
-        std::ranges::find_if(m_targets, [&](const auto &sizedTarget) {
-          return sizedTarget.target.lock() == target;
-        });
+    const auto it = findTarget(target);
     if (it == m_targets.end())
       return;
 
@@ -74,27 +95,22 @@ public:
   }
 
   void recalculate(eRecalculateReason = RECALCULATE_REASON_UNKNOWN) override {
-    if (!m_parent || !m_parent->space())
-      return;
-
-    std::vector<SRect> sizes;
-    sizes.reserve(m_targets.size());
-    for (const auto &sizedTarget : m_targets)
-      sizes.emplace_back(SRect{0, 0, sizedTarget.size.x, sizedTarget.size.y});
+    const auto sizes =
+        m_targets | std::views::transform([](const auto &sizedTarget) {
+          return SRect{0, 0, sizedTarget.size.x, sizedTarget.size.y};
+        }) |
+        std::ranges::to<std::vector<SRect>>();
 
     const auto workArea = m_parent->space()->workArea();
-    const auto packed = packCanvasMemo(
-        m_memo, sizes, SRect{workArea.x, workArea.y, workArea.w, workArea.h},
-        std::nullopt, 0, true);
+    packCanvasMemo(m_memo, sizes,
+                   SRect{workArea.x, workArea.y, workArea.w, workArea.h},
+                   std::nullopt, 0, true);
 
-    updateCanvasTranslation(packed);
+    updateCanvasTranslation();
   }
 
   SP<ITarget> getNextCandidate(SP<ITarget> old) override {
-    const auto it =
-        std::ranges::find_if(m_targets, [&](const auto &sizedTarget) {
-          return sizedTarget.target.lock() == old;
-        });
+    const auto it = findTarget(old);
     if (it == m_targets.end())
       return nullptr;
 
@@ -105,8 +121,17 @@ public:
 
   Config::ErrorResult layoutMsg(const std::string_view &message) override {
     if (message == "togglefocus") {
-      m_focusMode = !m_focusMode;
-      updateCanvasTranslation(m_memo.out);
+      switch (m_focusMode) {
+      case FocusMode::Smart:
+        m_focusMode = FocusMode::Center;
+        break;
+      case FocusMode::Center:
+        m_focusMode = FocusMode::Smart;
+        break;
+      case FocusMode::Count:
+        std::unreachable();
+      }
+      updateCanvasTranslation();
     }
     return {};
   }
@@ -116,18 +141,12 @@ public:
   }
 
   void swapTargets(SP<ITarget> a, SP<ITarget> b) override {
-    const auto first =
-        std::ranges::find_if(m_targets, [&](const auto &sizedTarget) {
-          return sizedTarget.target.lock() == a;
-        });
-    const auto second =
-        std::ranges::find_if(m_targets, [&](const auto &sizedTarget) {
-          return sizedTarget.target.lock() == b;
-        });
-    if (first != m_targets.end() && second != m_targets.end()) {
-      std::iter_swap(first, second);
-      recalculate();
-    }
+    const auto [first, second] = std::pair{findTarget(a), findTarget(b)};
+    if (first == m_targets.end() || second == m_targets.end())
+      return;
+
+    std::iter_swap(first, second);
+    recalculate();
   }
 
   void moveTargetInDirection(SP<ITarget>, Math::eDirection, bool) override {}
@@ -138,31 +157,90 @@ private:
     Vector2D size;
   };
 
-  void centerTarget(const SCanvasPack &packed, const SP<ITarget> &target) {
-    const auto it =
-        std::ranges::find_if(m_targets, [&](const auto &sizedTarget) {
-          return sizedTarget.target.lock() == target;
-        });
+  auto findTarget(this auto &self, const SP<ITarget> &target)
+      -> decltype(self.m_targets.begin()) {
+    if (!target)
+      return self.m_targets.end();
+
+    return std::ranges::find(
+        self.m_targets, target,
+        [](const auto &sizedTarget) { return sizedTarget.target.lock(); });
+  }
+
+  const SRect *getTargetRect(const SP<ITarget> &target) const {
+    const auto it = findTarget(target);
     if (it == m_targets.end())
+      return nullptr;
+
+    return &m_memo.out.rects[std::distance(m_targets.begin(), it)];
+  }
+
+  bool fullyVisible(const SP<ITarget> &target) const {
+    const auto rect = getTargetRect(target);
+    if (!rect)
+      return false;
+
+    const auto position = target->position().pos();
+    const auto workArea = m_parent->space()->workArea();
+    return position.x >= workArea.x - 0.5 && position.y >= workArea.y - 0.5 &&
+           position.x + rect->w <= workArea.x + workArea.w + 0.5 &&
+           position.y + rect->h <= workArea.y + workArea.h + 0.5;
+  }
+
+  void centerTarget(const SP<ITarget> &target) {
+    const auto rect = getTargetRect(target);
+    if (!rect)
       return;
 
-    const auto index =
-        static_cast<size_t>(std::distance(m_targets.begin(), it));
-    const auto &rect = packed.rects[index];
-    translateCanvas(packed,
-                    Vector2D{rect.x + rect.w / 2.0, rect.y + rect.h / 2.0},
+    translateCanvas(Vector2D{rect->x + rect->w / 2.0, rect->y + rect->h / 2.0},
                     m_parent->space()->workArea().middle());
   }
 
-  void updateCanvasTranslation(const SCanvasPack &packed) {
-    if (m_focusMode) {
-      const auto window = Desktop::focusState()->window();
-      if (window)
-        centerTarget(packed, window->layoutTarget());
+  void revealTarget(const SP<ITarget> &target, const SP<ITarget> &from) {
+    const auto rect = getTargetRect(target);
+    if (!rect)
+      return;
+
+    const auto workArea = m_parent->space()->workArea();
+    const auto view =
+        canvasView(m_memo.out.w, m_memo.out.h,
+                   SRect{workArea.x, workArea.y, workArea.w, workArea.h});
+
+    std::optional<SSpan> fromX, fromY;
+    if (const auto fromRect = getTargetRect(from)) {
+      fromX = SSpan{fromRect->x, fromRect->w};
+      fromY = SSpan{fromRect->y, fromRect->h};
+    }
+
+    static const std::vector<SSpan> NO_NEIGHBOURS;
+    const Vector2D offset{
+        smartRevealAxis(workArea.w, view.maxX, {rect->x, rect->w}, fromX,
+                        NO_NEIGHBOURS, 0, 0),
+        smartRevealAxis(workArea.h, view.maxY, {rect->y, rect->h}, fromY,
+                        NO_NEIGHBOURS, 0, 0)};
+    translateCanvas(offset, {view.originX, view.originY});
+  }
+
+  void updateCanvasTranslation() {
+    const auto window = Desktop::focusState()->window();
+    const auto target = window ? window->layoutTarget() : SP<ITarget>{};
+    if (findTarget(target) != m_targets.end()) {
+      switch (m_focusMode) {
+      case FocusMode::Smart:
+        revealTarget(target, {});
+        break;
+      case FocusMode::Center:
+        centerTarget(target);
+        break;
+      case FocusMode::Count:
+        std::unreachable();
+      }
+
+      if (m_lastFocus.expired())
+        m_lastFocus = target;
     } else {
-      const auto workArea = m_parent->space()->workArea();
-      translateCanvas(packed, Vector2D{packed.w / 2.0, packed.h / 2.0},
-                      workArea.middle());
+      translateCanvas(Vector2D{m_memo.out.w / 2.0, m_memo.out.h / 2.0},
+                      m_parent->space()->workArea().middle());
     }
   }
 
@@ -172,19 +250,24 @@ private:
   }
 
   // Translate canvasPoint in packer-local coordinates onto globalPoint.
-  void translateCanvas(const SCanvasPack &packed, const Vector2D &canvasPoint,
-                       const Vector2D &globalPoint) {
+  void translateCanvas(const Vector2D &canvasPoint,
+                       const Vector2D &globalPoint) const {
+    assert(m_targets.size() == m_memo.out.rects.size());
+
     const auto origin = globalPoint - canvasPoint;
-    for (size_t i = 0; i < m_targets.size(); ++i) {
-      const auto &rect = packed.rects[i];
-      m_targets[i].target.lock()->setPositionGlobal(
+    for (const auto &[sizedTarget, rect] :
+         std::views::zip(m_targets, m_memo.out.rects)) {
+      const auto target = sizedTarget.target.lock();
+      assert(target);
+      target->setPositionGlobal(
           CBox{origin.x + rect.x, origin.y + rect.y, rect.w, rect.h});
     }
   }
 
   std::vector<SSizedTarget> m_targets;
   SCanvasMemo m_memo;
-  bool m_focusMode;
+  WP<ITarget> m_lastFocus;
+  FocusMode m_focusMode;
   CHyprSignalListener m_focusListener;
 };
 } // namespace
@@ -193,6 +276,6 @@ UP<Layout::ITiledAlgorithm> Hyprmosaic::makeLayout() {
   return makeUnique<CMosaicLayout>();
 }
 
-const std::type_info *Hyprmosaic::layoutType() {
+const std::type_info *Hyprmosaic::layoutType() noexcept {
   return &typeid(CMosaicLayout);
 }

@@ -31,13 +31,13 @@ hl.config({
             default_width = 0.6,
             -- Default window height: <= 1 = fraction of workspace height; > 1 = pixels
             default_height = 0.6,
-            -- Initial focus-mode state for each workspace: 0 = off, 1 = on
-            focus_mode = 1,
+            -- Focus mode: 0 = off, 1 = on
+            focus_mode = 0,
         },
     },
 })
 
--- Toggle focus mode for the current workspace
+-- Toggle focus mode
 hl.bind("SUPER + C", hl.dsp.layout("togglefocus"))
 ```
 

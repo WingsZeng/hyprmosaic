@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <utility>
 
 namespace {
 constexpr auto DEFAULT_WIDTH_KEY = "plugin:hyprmosaic:default_width";
@@ -13,11 +14,11 @@ constexpr auto DEFAULT_HEIGHT_KEY = "plugin:hyprmosaic:default_height";
 constexpr auto FOCUS_MODE_KEY = "plugin:hyprmosaic:focus_mode";
 
 constexpr auto DEFAULT_SIZE = 0.6F;
-constexpr auto DEFAULT_FOCUS_MODE = 1;
+constexpr auto DEFAULT_FOCUS_MODE =
+    std::to_underlying(Hyprmosaic::Config::FocusMode::Smart);
 
-CConfigValue<Hyprlang::FLOAT> defaultWidth;
-CConfigValue<Hyprlang::FLOAT> defaultHeight;
-CConfigValue<Hyprlang::INT> focusMode;
+CConfigValue<Hyprlang::FLOAT> defaultWidthValue, defaultHeightValue;
+CConfigValue<Hyprlang::INT> focusModeValue;
 
 double resolveSize(double value, double extent) {
   return std::max(1.0, value <= 1.0 ? value * extent : value);
@@ -36,23 +37,27 @@ void Hyprmosaic::Config::registerValues(HANDLE handle) {
       "default window height; <= 1 is work-area ratio, > 1 is pixels",
       DEFAULT_SIZE, SFloatValueOptions{.min = 0.001F});
 
-  auto focus =
-      makeShared<CIntValue>(FOCUS_MODE_KEY, "focus mode", DEFAULT_FOCUS_MODE,
-                            SIntValueOptions{.min = 0, .max = 1});
+  auto focus = makeShared<CIntValue>(
+      FOCUS_MODE_KEY, "focus mode: 0 = smart, 1 = center", DEFAULT_FOCUS_MODE,
+      SIntValueOptions{
+          .min = 0,
+          .max = std::to_underlying(Hyprmosaic::Config::FocusMode::Count) - 1});
 
-  if (!HyprlandAPI::addConfigValueV2(handle, width) ||
-      !HyprlandAPI::addConfigValueV2(handle, height) ||
-      !HyprlandAPI::addConfigValueV2(handle, focus))
+  if (!HyprlandAPI::addConfigValueV2(handle, std::move(width)) ||
+      !HyprlandAPI::addConfigValueV2(handle, std::move(height)) ||
+      !HyprlandAPI::addConfigValueV2(handle, std::move(focus)))
     throw std::runtime_error("failed to register hyprmosaic config values");
 
-  defaultWidth.bind(DEFAULT_WIDTH_KEY);
-  defaultHeight.bind(DEFAULT_HEIGHT_KEY);
-  focusMode.bind(FOCUS_MODE_KEY);
+  defaultWidthValue.bind(DEFAULT_WIDTH_KEY);
+  defaultHeightValue.bind(DEFAULT_HEIGHT_KEY);
+  focusModeValue.bind(FOCUS_MODE_KEY);
 }
 
 Vector2D Hyprmosaic::Config::defaultSize(const Vector2D &workAreaSize) {
-  return {resolveSize(*defaultWidth, workAreaSize.x),
-          resolveSize(*defaultHeight, workAreaSize.y)};
+  return {resolveSize(*defaultWidthValue, workAreaSize.x),
+          resolveSize(*defaultHeightValue, workAreaSize.y)};
 }
 
-bool Hyprmosaic::Config::focusModeEnabled() { return *focusMode != 0; }
+Hyprmosaic::Config::FocusMode Hyprmosaic::Config::focusMode() {
+  return static_cast<FocusMode>(*focusModeValue);
+}
