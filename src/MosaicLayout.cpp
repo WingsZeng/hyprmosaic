@@ -77,10 +77,6 @@ public:
     if (!m_parent || !m_parent->space())
       return;
 
-    const auto workspace = m_parent->space()->workspace();
-    if (!workspace || !workspace->visible())
-      return;
-
     std::vector<SRect> sizes;
     sizes.reserve(m_targets.size());
     for (const auto &sizedTarget : m_targets)
