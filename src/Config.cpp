@@ -1,8 +1,8 @@
 #include "Config.hpp"
 
 #include <hyprland/src/config/ConfigValue.hpp>
+#include <hyprland/src/config/values/types/BoolValue.hpp>
 #include <hyprland/src/config/values/types/FloatValue.hpp>
-#include <hyprland/src/config/values/types/IntValue.hpp>
 
 #include <algorithm>
 #include <stdexcept>
@@ -14,11 +14,11 @@ constexpr auto DEFAULT_HEIGHT_KEY = "plugin:hyprmosaic:default_height";
 constexpr auto FOCUS_MODE_KEY = "plugin:hyprmosaic:focus_mode";
 
 constexpr auto DEFAULT_SIZE = 0.6F;
-constexpr auto DEFAULT_FOCUS_MODE =
-    std::to_underlying(Hyprmosaic::Config::FocusMode::Smart);
+constexpr auto DEFAULT_FOCUS_MODE = false;
 
-CConfigValue<Hyprlang::FLOAT> defaultWidthValue, defaultHeightValue;
-CConfigValue<Hyprlang::INT> focusModeValue;
+CConfigValue<Hyprlang::FLOAT> defaultWidthValue;
+CConfigValue<Hyprlang::FLOAT> defaultHeightValue;
+CConfigValue<::Config::BOOL> focusModeValue;
 
 double resolveSize(double value, double extent) {
   return std::max(1.0, value <= 1.0 ? value * extent : value);
@@ -37,11 +37,8 @@ void Hyprmosaic::Config::registerValues(HANDLE handle) {
       "default window height; <= 1 is work-area ratio, > 1 is pixels",
       DEFAULT_SIZE, SFloatValueOptions{.min = 0.001F});
 
-  auto focus = makeShared<CIntValue>(
-      FOCUS_MODE_KEY, "focus mode: 0 = smart, 1 = center", DEFAULT_FOCUS_MODE,
-      SIntValueOptions{
-          .min = 0,
-          .max = std::to_underlying(Hyprmosaic::Config::FocusMode::Count) - 1});
+  auto focus = makeShared<CBoolValue>(
+      FOCUS_MODE_KEY, "keep the focused window centered", DEFAULT_FOCUS_MODE);
 
   if (!HyprlandAPI::addConfigValueV2(handle, std::move(width)) ||
       !HyprlandAPI::addConfigValueV2(handle, std::move(height)) ||
@@ -58,6 +55,4 @@ Vector2D Hyprmosaic::Config::defaultSize(const Vector2D &workAreaSize) {
           resolveSize(*defaultHeightValue, workAreaSize.y)};
 }
 
-Hyprmosaic::Config::FocusMode Hyprmosaic::Config::focusMode() {
-  return static_cast<FocusMode>(*focusModeValue);
-}
+bool Hyprmosaic::Config::focusMode() { return *focusModeValue; }

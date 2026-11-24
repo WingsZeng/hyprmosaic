@@ -1,4 +1,6 @@
 #include "MosaicLayout.hpp"
+
+#include "CanvasDragController.hpp"
 #include "Config.hpp"
 
 #include <MosaicCanvas.hpp>
@@ -12,20 +14,24 @@
 
 #include <algorithm>
 #include <cassert>
+#include <charconv>
+#include <cmath>
 #include <iterator>
 #include <optional>
 #include <ranges>
-#include <utility>
+#include <string_view>
 #include <vector>
 
 namespace {
 using namespace Layout;
 using namespace Hyprdrive::MosaicPack;
-using Hyprmosaic::Config::FocusMode;
+using namespace std::string_view_literals;
 
-class CMosaicLayout final : public ITiledAlgorithm {
+class CMosaicLayout final : public ITiledAlgorithm,
+                            private Hyprmosaic::ICanvasDragTarget {
 public:
-  CMosaicLayout() : m_focusMode(Hyprmosaic::Config::focusMode()) {
+  CMosaicLayout()
+      : m_focusMode(Hyprmosaic::Config::focusMode()), m_dragController(*this) {
     m_focusListener = Event::bus()->m_events.window.active.listen(
         [this](PHLWINDOW window, Desktop::eFocusReason) {
           if (!window || !m_parent->space()->workspace()->visible())
@@ -35,239 +41,346 @@ public:
           if (findTarget(target) == m_targets.end())
             return;
 
-          switch (m_focusMode) {
-          case FocusMode::Smart: {
-            const auto from = m_lastFocus.lock();
-            if (from == target || findTarget(from) == m_targets.end()) {
-              if (!fullyVisible(target))
-                revealTarget(target, {});
-            } else if (!fullyVisible(target) || !fullyVisible(from))
-              revealTarget(target, from);
-            break;
+          const bool targetVisible = isFullyVisible(target);
+          if (!(m_manual && targetVisible)) {
+            m_manual = false;
+            if (m_focusMode)
+              centerTarget(target);
+            else {
+              const auto previous = m_previousFocus.lock();
+              const bool previousVisible =
+                  !previous || previous == target ||
+                  findTarget(previous) == m_targets.end() ||
+                  isFullyVisible(previous);
+              if (!targetVisible || !previousVisible)
+                fitTarget(target, previous);
+            }
           }
-          case FocusMode::Center:
-            centerTarget(target);
-            break;
-          case FocusMode::Count:
-            std::unreachable();
-          }
-
-          m_lastFocus = target;
+          m_previousFocus = target;
         });
   }
 
   void newTarget(SP<ITarget> target) override {
-    m_targets.push_back({target, defaultSize()});
-    recalculate();
+    if (addTarget(target, defaultTargetSize())) {
+      m_manual = false;
+      recalculate();
+    }
   }
 
   void movedTarget(SP<ITarget> target, std::optional<Vector2D>) override {
     auto size = target->position().size();
     if (size.x <= 0 || size.y <= 0) {
       const auto desired = target->desiredGeometry();
-      size = desired ? desired->size : defaultSize();
+      size = desired && desired->size.x > 0 && desired->size.y > 0
+                 ? desired->size
+                 : defaultTargetSize();
     }
-    m_targets.push_back({target, size});
-    recalculate();
+    if (addTarget(target, size)) {
+      m_manual = false;
+      recalculate();
+    }
   }
 
   void removeTarget(SP<ITarget> target) override {
-    if (const auto it = findTarget(target); it != m_targets.end())
-      m_targets.erase(it);
+    const auto targetIt = findTarget(target);
+    if (targetIt == m_targets.end())
+      return;
+
+    m_targets.erase(targetIt);
+    m_manual = false;
     recalculate();
   }
 
   void resizeTarget(const Vector2D &delta, SP<ITarget> target,
                     eRectCorner corner) override {
-    const auto it = findTarget(target);
-    if (it == m_targets.end())
+    const auto targetIt = findTarget(target);
+    if (targetIt == m_targets.end())
       return;
 
-    auto growth = delta;
-    if (corner != CORNER_NONE) {
+    Vector2D growth;
+    if (corner == CORNER_NONE)
+      growth = delta;
+    else {
       growth.x = edgeLeft(corner) ? -delta.x : edgeRight(corner) ? delta.x : 0;
       growth.y = edgeTop(corner) ? -delta.y : edgeBottom(corner) ? delta.y : 0;
     }
 
-    it->size.x = std::max(1.0, it->size.x + growth.x);
-    it->size.y = std::max(1.0, it->size.y + growth.y);
+    targetIt->size.x = std::max(MIN_TARGET_SIZE, targetIt->size.x + growth.x);
+    targetIt->size.y = std::max(MIN_TARGET_SIZE, targetIt->size.y + growth.y);
+    m_manual = false;
     recalculate();
   }
 
   void recalculate(eRecalculateReason = RECALCULATE_REASON_UNKNOWN) override {
-    const auto sizes =
-        m_targets | std::views::transform([](const auto &sizedTarget) {
-          return SRect{0, 0, sizedTarget.size.x, sizedTarget.size.y};
-        }) |
-        std::ranges::to<std::vector<SRect>>();
+    m_workArea = m_parent->space()->workArea();
+    const auto sizes = m_targets |
+                       std::views::transform([](const auto &target) {
+                         return SRect{0, 0, target.size.x, target.size.y};
+                       }) |
+                       std::ranges::to<std::vector<SRect>>();
+    packCanvasMemo(m_packMemo, sizes, SRect{0, 0, m_workArea.w, m_workArea.h},
+                   std::nullopt, PACK_GAP, PACK_IN_TWO_DIMENSIONS);
+    m_geometryDirty = true;
 
-    const auto workArea = m_parent->space()->workArea();
-    packCanvasMemo(m_memo, sizes,
-                   SRect{workArea.x, workArea.y, workArea.w, workArea.h},
-                   std::nullopt, 0, true);
-
-    updateCanvasTranslation();
+    if (m_manual && m_canvasOffset)
+      translateCanvas(*m_canvasOffset);
+    else {
+      const auto window = Desktop::focusState()->window();
+      const auto target = window ? window->layoutTarget() : SP<ITarget>{};
+      if (findTarget(target) == m_targets.end())
+        centerCanvas();
+      else if (m_focusMode)
+        centerTarget(target);
+      else
+        fitTarget(target, {});
+    }
   }
 
   SP<ITarget> getNextCandidate(SP<ITarget> old) override {
-    const auto it = findTarget(old);
-    if (it == m_targets.end())
+    const auto targetIt = findTarget(old);
+    if (targetIt == m_targets.end())
       return nullptr;
 
-    const auto previous =
-        it == m_targets.begin() ? std::prev(m_targets.end()) : std::prev(it);
-    return previous == it ? nullptr : previous->target.lock();
+    const auto previous = targetIt == m_targets.begin()
+                              ? std::prev(m_targets.end())
+                              : std::prev(targetIt);
+    return previous == targetIt ? nullptr : previous->target.lock();
   }
 
   Config::ErrorResult layoutMsg(const std::string_view &message) override {
-    if (message == "togglefocus") {
-      switch (m_focusMode) {
-      case FocusMode::Smart:
-        m_focusMode = FocusMode::Center;
-        break;
-      case FocusMode::Center:
-        m_focusMode = FocusMode::Smart;
-        break;
-      case FocusMode::Count:
-        std::unreachable();
+    if (message == TOGGLE_FOCUS_MESSAGE) {
+      if (m_manual) {
+        m_manual = false;
+        const auto window = Desktop::focusState()->window();
+        const auto target = window ? window->layoutTarget() : SP<ITarget>{};
+        if (findTarget(target) == m_targets.end())
+          centerCanvas();
+        else if (m_focusMode)
+          centerTarget(target);
+        else {
+          const Vector2D centeredOffset =
+              Vector2D{m_workArea.w / 2.0, m_workArea.h / 2.0} -
+              Vector2D{m_packMemo.out.w / 2.0, m_packMemo.out.h / 2.0};
+          if (isFullyVisible(target, centeredOffset))
+            translateCanvas(centeredOffset);
+          else
+            fitTarget(target, {});
+        }
+      } else {
+        m_focusMode = !m_focusMode;
+        recalculate();
       }
-      updateCanvasTranslation();
-    }
+    } else if (message == MOUSE_PAN_MESSAGE)
+      m_dragController.beginDrag();
+    else if (const auto delta = parsePanDelta(message))
+      panCanvas(*delta);
     return {};
   }
 
   std::optional<Vector2D> predictSizeForNewTarget() override {
-    return std::nullopt;
+    return defaultTargetSize();
   }
 
   void swapTargets(SP<ITarget> a, SP<ITarget> b) override {
-    const auto [first, second] = std::pair{findTarget(a), findTarget(b)};
+    const auto first = findTarget(a);
+    const auto second = findTarget(b);
     if (first == m_targets.end() || second == m_targets.end())
       return;
 
     std::iter_swap(first, second);
+    m_manual = false;
     recalculate();
   }
 
   void moveTargetInDirection(SP<ITarget>, Math::eDirection, bool) override {}
 
 private:
-  struct SSizedTarget {
+  static constexpr auto TOGGLE_FOCUS_MESSAGE = "togglefocus"sv;
+  static constexpr auto MOUSE_PAN_MESSAGE = "panmouse"sv;
+  static constexpr auto PAN_MESSAGE_PREFIX = "pan "sv;
+  static constexpr auto MIN_TARGET_SIZE = 1.0;
+  static constexpr auto PACK_GAP = 0.0;
+  static constexpr auto PACK_IN_TWO_DIMENSIONS = true;
+  static constexpr auto VISIBILITY_TOLERANCE = 0.5;
+  static constexpr auto REVEAL_MARGIN = 0.0;
+  static constexpr auto NEIGHBOUR_PEEK = 0.0;
+
+  static std::optional<Vector2D> parsePanDelta(const std::string_view message) {
+    if (!message.starts_with(PAN_MESSAGE_PREFIX))
+      return std::nullopt;
+
+    auto arguments = message.substr(PAN_MESSAGE_PREFIX.size());
+    const auto trimSpaces = [](std::string_view value) {
+      while (!value.empty() && value.front() == ' ')
+        value.remove_prefix(1);
+      return value;
+    };
+    const auto parseNumber = [&](double &value) {
+      arguments = trimSpaces(arguments);
+      const auto [end, error] = std::from_chars(
+          arguments.data(), arguments.data() + arguments.size(), value);
+      if (error != std::errc{} || end == arguments.data())
+        return false;
+      arguments.remove_prefix(end - arguments.data());
+      return std::isfinite(value);
+    };
+
+    Vector2D delta;
+    if (!parseNumber(delta.x) || !parseNumber(delta.y) ||
+        !trimSpaces(arguments).empty())
+      return std::nullopt;
+    return delta;
+  }
+
+  struct STarget {
     WP<ITarget> target;
     Vector2D size;
   };
+
+  bool addTarget(const SP<ITarget> &target, const Vector2D &size) {
+    if (findTarget(target) != m_targets.end())
+      return false;
+
+    m_targets.push_back({target, size});
+    return true;
+  }
 
   auto findTarget(this auto &self, const SP<ITarget> &target)
       -> decltype(self.m_targets.begin()) {
     if (!target)
       return self.m_targets.end();
 
-    return std::ranges::find(
-        self.m_targets, target,
-        [](const auto &sizedTarget) { return sizedTarget.target.lock(); });
+    return std::ranges::find(self.m_targets, target, [](const auto &entry) {
+      return entry.target.lock();
+    });
   }
 
-  const SRect *getTargetRect(const SP<ITarget> &target) const {
-    const auto it = findTarget(target);
-    if (it == m_targets.end())
+  const SRect *packedRect(const SP<ITarget> &target) const {
+    const auto targetIt = findTarget(target);
+    if (targetIt == m_targets.end())
       return nullptr;
 
-    return &m_memo.out.rects[std::distance(m_targets.begin(), it)];
+    const auto index = std::distance(m_targets.cbegin(), targetIt);
+    return &m_packMemo.out.rects[index];
   }
 
-  bool fullyVisible(const SP<ITarget> &target) const {
-    const auto rect = getTargetRect(target);
+  bool isFullyVisible(const SP<ITarget> &target, const Vector2D &offset) const {
+    const auto rect = packedRect(target);
     if (!rect)
       return false;
 
-    const auto position = target->position().pos();
-    const auto workArea = m_parent->space()->workArea();
-    return position.x >= workArea.x - 0.5 && position.y >= workArea.y - 0.5 &&
-           position.x + rect->w <= workArea.x + workArea.w + 0.5 &&
-           position.y + rect->h <= workArea.y + workArea.h + 0.5;
+    const Vector2D targetPosition{offset.x + rect->x, offset.y + rect->y};
+    return targetPosition.x >= -VISIBILITY_TOLERANCE &&
+           targetPosition.y >= -VISIBILITY_TOLERANCE &&
+           targetPosition.x + rect->w <= m_workArea.w + VISIBILITY_TOLERANCE &&
+           targetPosition.y + rect->h <= m_workArea.h + VISIBILITY_TOLERANCE;
+  }
+
+  bool isFullyVisible(const SP<ITarget> &target) const {
+    return m_canvasOffset && isFullyVisible(target, *m_canvasOffset);
+  }
+
+  void centerCanvas() {
+    const Vector2D offset =
+        Vector2D{m_workArea.w / 2.0, m_workArea.h / 2.0} -
+        Vector2D{m_packMemo.out.w / 2.0, m_packMemo.out.h / 2.0};
+    translateCanvas(offset);
   }
 
   void centerTarget(const SP<ITarget> &target) {
-    const auto rect = getTargetRect(target);
+    const auto rect = packedRect(target);
     if (!rect)
       return;
 
-    translateCanvas(Vector2D{rect->x + rect->w / 2.0, rect->y + rect->h / 2.0},
-                    m_parent->space()->workArea().middle());
+    const Vector2D offset =
+        Vector2D{m_workArea.w / 2.0, m_workArea.h / 2.0} -
+        Vector2D{rect->x + rect->w / 2.0, rect->y + rect->h / 2.0};
+    translateCanvas(offset);
   }
 
-  void revealTarget(const SP<ITarget> &target, const SP<ITarget> &from) {
-    const auto rect = getTargetRect(target);
-    if (!rect)
-      return;
+  void fitTarget(const SP<ITarget> &target, const SP<ITarget> &previous) {
+    const auto targetRect = packedRect(target);
+    assert(targetRect);
 
-    const auto workArea = m_parent->space()->workArea();
-    const auto view =
-        canvasView(m_memo.out.w, m_memo.out.h,
-                   SRect{workArea.x, workArea.y, workArea.w, workArea.h});
+    const auto previousRect =
+        previous == target ? nullptr : packedRect(previous);
+    const auto view = canvasView(m_packMemo.out.w, m_packMemo.out.h,
+                                 SRect{0, 0, m_workArea.w, m_workArea.h});
 
-    std::optional<SSpan> fromX, fromY;
-    if (const auto fromRect = getTargetRect(from)) {
-      fromX = SSpan{fromRect->x, fromRect->w};
-      fromY = SSpan{fromRect->y, fromRect->h};
+    std::optional<SSpan> previousX, previousY;
+    if (previousRect) {
+      previousX = SSpan{previousRect->x, previousRect->w};
+      previousY = SSpan{previousRect->y, previousRect->h};
     }
 
     static const std::vector<SSpan> NO_NEIGHBOURS;
+    const Vector2D viewportOffset{
+        smartRevealAxis(m_workArea.w, view.maxX, {targetRect->x, targetRect->w},
+                        previousX, NO_NEIGHBOURS, REVEAL_MARGIN,
+                        NEIGHBOUR_PEEK),
+        smartRevealAxis(m_workArea.h, view.maxY, {targetRect->y, targetRect->h},
+                        previousY, NO_NEIGHBOURS, REVEAL_MARGIN,
+                        NEIGHBOUR_PEEK)};
+    translateCanvas(
+        {view.originX - viewportOffset.x, view.originY - viewportOffset.y});
+  }
+
+  bool acceptsCanvasDrag(const Vector2D &position) const override {
+    if (!m_parent || !m_parent->space() ||
+        !m_parent->space()->workspace()->visible())
+      return false;
+
+    return m_workArea.containsPoint(position);
+  }
+
+  void panCanvas(const Vector2D &delta) override {
+    if (!m_canvasOffset)
+      return;
+
+    const auto center = Vector2D{m_workArea.w / 2.0, m_workArea.h / 2.0};
+    const auto requestedOffset = *m_canvasOffset + delta;
     const Vector2D offset{
-        smartRevealAxis(workArea.w, view.maxX, {rect->x, rect->w}, fromX,
-                        NO_NEIGHBOURS, 0, 0),
-        smartRevealAxis(workArea.h, view.maxY, {rect->y, rect->h}, fromY,
-                        NO_NEIGHBOURS, 0, 0)};
-    translateCanvas(offset, {view.originX, view.originY});
+        std::clamp(requestedOffset.x, center.x - m_packMemo.out.w, center.x),
+        std::clamp(requestedOffset.y, center.y - m_packMemo.out.h, center.y)};
+    if (offset == *m_canvasOffset)
+      return;
+
+    m_manual = true;
+    translateCanvas(offset);
   }
 
-  void updateCanvasTranslation() {
-    const auto window = Desktop::focusState()->window();
-    const auto target = window ? window->layoutTarget() : SP<ITarget>{};
-    if (findTarget(target) != m_targets.end()) {
-      switch (m_focusMode) {
-      case FocusMode::Smart:
-        revealTarget(target, {});
-        break;
-      case FocusMode::Center:
-        centerTarget(target);
-        break;
-      case FocusMode::Count:
-        std::unreachable();
-      }
-
-      if (m_lastFocus.expired())
-        m_lastFocus = target;
-    } else {
-      translateCanvas(Vector2D{m_memo.out.w / 2.0, m_memo.out.h / 2.0},
-                      m_parent->space()->workArea().middle());
-    }
-  }
-
-  Vector2D defaultSize() const {
+  Vector2D defaultTargetSize() const {
     return Hyprmosaic::Config::defaultSize(
         m_parent->space()->workArea().size());
   }
 
-  // Translate canvasPoint in packer-local coordinates onto globalPoint.
-  void translateCanvas(const Vector2D &canvasPoint,
-                       const Vector2D &globalPoint) const {
-    assert(m_targets.size() == m_memo.out.rects.size());
+  void translateCanvas(const Vector2D &offset) {
+    if (!m_geometryDirty && m_canvasOffset && *m_canvasOffset == offset)
+      return;
 
-    const auto origin = globalPoint - canvasPoint;
-    for (const auto &[sizedTarget, rect] :
-         std::views::zip(m_targets, m_memo.out.rects)) {
-      const auto target = sizedTarget.target.lock();
+    assert(m_targets.size() == m_packMemo.out.rects.size());
+    m_canvasOffset = offset;
+    m_geometryDirty = false;
+    const auto globalCanvasOrigin = m_workArea.pos() + offset;
+    for (const auto &[targetEntry, rect] :
+         std::views::zip(m_targets, m_packMemo.out.rects)) {
+      const auto target = targetEntry.target.lock();
       assert(target);
-      target->setPositionGlobal(
-          CBox{origin.x + rect.x, origin.y + rect.y, rect.w, rect.h});
+      target->setPositionGlobal(CBox{globalCanvasOrigin.x + rect.x,
+                                     globalCanvasOrigin.y + rect.y, rect.w,
+                                     rect.h});
     }
   }
 
-  std::vector<SSizedTarget> m_targets;
-  SCanvasMemo m_memo;
-  WP<ITarget> m_lastFocus;
-  FocusMode m_focusMode;
+  std::vector<STarget> m_targets;
+  SCanvasMemo m_packMemo;
+  CBox m_workArea;
+  std::optional<Vector2D> m_canvasOffset;
+  WP<ITarget> m_previousFocus;
+  bool m_focusMode;
+  bool m_manual = false;
+  bool m_geometryDirty = false;
+  Hyprmosaic::CCanvasDragController m_dragController;
   CHyprSignalListener m_focusListener;
 };
 } // namespace

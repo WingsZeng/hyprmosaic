@@ -9,6 +9,7 @@ The Mosaic layout separated from [Hyprdrive](https://github.com/dragosol/Hyprdri
 
 - Infinite canvas
 - Focus mode: keeps the active window centered
+- Panning canvas by mouse and keyboard
 
 ## Install
 
@@ -31,14 +32,23 @@ hl.config({
             default_width = 0.6,
             -- Default window height: <= 1 = fraction of workspace height; > 1 = pixels
             default_height = 0.6,
-            -- Focus mode: 0 = off, 1 = on
-            focus_mode = 0,
+            -- Default focus mode;
+            focus_mode = false,
         },
     },
 })
 
 -- Toggle focus mode
 hl.bind("SUPER + C", hl.dsp.layout("togglefocus"))
+
+-- Pan canvas by mouse;
+hl.bind("SUPER + mouse:274", hl.dsp.layout("panmouse"), { mouse = true })
+
+-- Pan canvas by keyboard;
+hl.bind("SUPER + CTRL + LEFT", hl.dsp.layout("pan 200 0"), { repeating = true })
+hl.bind("SUPER + CTRL + RIGHT", hl.dsp.layout("pan -200 0"), { repeating = true })
+hl.bind("SUPER + CTRL + UP", hl.dsp.layout("pan 0 200"), { repeating = true })
+hl.bind("SUPER + CTRL + DOWN", hl.dsp.layout("pan 0 -200"), { repeating = true })
 ```
 
 ## Credits
