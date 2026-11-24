@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.19)
 project(hyprmosaic LANGUAGES CXX)
 
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(HYPRLAND REQUIRED IMPORTED_TARGET hyprland)
 
